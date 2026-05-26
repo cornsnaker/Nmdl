@@ -23,12 +23,17 @@ Dependencies: pyrogram>=2.0, tgcrypto, plus N_m3u8DL-RE and ffmpeg on $PATH.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
+import html
+import json
 import logging
+import logging.handlers
 import os
 import re
 import shlex
 import shutil
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -63,17 +68,57 @@ PROGRESS_INTERVAL = float(os.getenv("PROGRESS_INTERVAL", "4.0"))  # seconds
 PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "60"))           # seconds
 PROBE_IDLE = float(os.getenv("PROBE_IDLE", "3.0"))                # seconds
 DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", "7200"))   # seconds (2h)
+PAGE_SIZE = max(1, int(os.getenv("PAGE_SIZE", "6")))              # buttons / page
+
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))                        # required for owner cmds
+AUTH_FILE = Path(os.getenv("AUTH_FILE", "./auth_users.json")).resolve()
+LOG_FILE = Path(os.getenv("LOG_FILE", "./bot.log")).resolve()
+LOG_BUFFER = max(50, int(os.getenv("LOG_BUFFER", "1000")))        # ring buffer size
+SHELL_TIMEOUT = float(os.getenv("SHELL_TIMEOUT", "60"))           # /shell hard cap
 
 if not (API_ID and API_HASH and BOT_TOKEN):
     raise SystemExit("API_ID, API_HASH and BOT_TOKEN env vars must be set")
+if OWNER_ID == 0:
+    # Not fatal — bot still works for the public /dl flow, but owner cmds are disabled.
+    logging.getLogger("nmdl-bot").warning(
+        "OWNER_ID not set — /auth, /unauth, /restart, /logs, /shell will be disabled"
+    )
 
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+_LOG_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=_LOG_FMT)
 log = logging.getLogger("nmdl-bot")
+
+
+class _RingHandler(logging.Handler):
+    """Keeps the last N formatted log lines in memory for /logs."""
+
+    def __init__(self, capacity: int):
+        super().__init__()
+        self.buf: collections.deque[str] = collections.deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buf.append(self.format(record))
+        except Exception:  # never let logging crash the bot
+            pass
+
+
+_log_formatter = logging.Formatter(_LOG_FMT)
+
+LOG_RING = _RingHandler(LOG_BUFFER)
+LOG_RING.setFormatter(_log_formatter)
+logging.getLogger().addHandler(LOG_RING)
+
+try:
+    _file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _file_handler.setFormatter(_log_formatter)
+    logging.getLogger().addHandler(_file_handler)
+except Exception as _e:  # e.g. read-only fs
+    log.warning("Could not attach file log handler at %s: %s", LOG_FILE, _e)
 
 # ---------------------------------------------------------------------------
 # Regex / helpers
@@ -109,6 +154,58 @@ def human_bytes(n: int) -> str:
             return f"{f:.1f} {unit}"
         f /= 1024.0
     return f"{f:.1f} PB"
+
+
+# --- filename sanitisation ---------------------------------------------------
+
+_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+def sanitize_filename(raw: str, fallback: str = "video") -> str:
+    """Clean a user-provided filename: strip path separators, control chars,
+    leading/trailing whitespace and dots, cap length to 200 chars."""
+    if not raw:
+        return fallback
+    cleaned = _BAD_NAME_CHARS.sub("_", raw).strip().strip(".")
+    cleaned = cleaned[:200].strip()
+    return cleaned or fallback
+
+
+# --- auth (owner + authorized user list) ------------------------------------
+
+AUTH_USERS: set[int] = set()
+
+
+def _load_auth() -> None:
+    global AUTH_USERS
+    try:
+        if AUTH_FILE.exists():
+            data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+            AUTH_USERS = {int(x) for x in data}
+            log.info("loaded %d authorized user(s) from %s", len(AUTH_USERS), AUTH_FILE)
+    except Exception as e:
+        log.warning("failed to load auth file %s: %s", AUTH_FILE, e)
+        AUTH_USERS = set()
+
+
+def _save_auth() -> None:
+    try:
+        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_FILE.write_text(json.dumps(sorted(AUTH_USERS)), encoding="utf-8")
+    except Exception as e:
+        log.warning("failed to save auth file %s: %s", AUTH_FILE, e)
+
+
+def _is_owner(uid: Optional[int]) -> bool:
+    return bool(OWNER_ID) and uid == OWNER_ID
+
+
+def _is_authorized(uid: Optional[int]) -> bool:
+    if not uid:
+        return False
+    return _is_owner(uid) or uid in AUTH_USERS
+
+
+_load_auth()
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +299,15 @@ class Job:
     chosen_video: Optional[str] = None
     chosen_audio: Optional[str] = None    # "all" | "<id>"
     chosen_sub: Optional[str] = None      # "all" | "none" | "<id>"
+
+    # FSM bit flipped between subs choice and the user's filename text reply.
+    awaiting_name: bool = False
+    custom_name: Optional[str] = None     # sanitized base name (no extension)
+
+    # Current page index for each step's keyboard (0-based).
+    page_v: int = 0
+    page_a: int = 0
+    page_s: int = 0
 
     work_dir: Path = field(default_factory=Path)
     proc: Optional[asyncio.subprocess.Process] = None
@@ -331,20 +437,49 @@ def _cb(short_id: str, step: str, value: str) -> str:
     return f"j:{short_id}:{step}:{value}"
 
 
+def _paginate(items: list, page: int) -> tuple[list, int, int]:
+    """Slice `items` for `page`. Returns (window, clamped_page, total_pages)."""
+    total = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total - 1))
+    start = page * PAGE_SIZE
+    return items[start : start + PAGE_SIZE], page, total
+
+
+def _nav_row(short_id: str, nav_step: str, page: int, total: int) -> Optional[list]:
+    """Prev / page-indicator / Next row. `nav_step` is uppercase (V/A/S)."""
+    if total <= 1:
+        return None
+    prev_p = (page - 1) % total
+    next_p = (page + 1) % total
+    return [
+        InlineKeyboardButton("« Prev", callback_data=_cb(short_id, nav_step, str(prev_p))),
+        InlineKeyboardButton(f"{page + 1}/{total}", callback_data=_cb(short_id, "n", "0")),
+        InlineKeyboardButton("Next »", callback_data=_cb(short_id, nav_step, str(next_p))),
+    ]
+
+
 def kb_videos(job: Job) -> InlineKeyboardMarkup:
+    window, job.page_v, total = _paginate(job.videos, job.page_v)
     rows = [
         [InlineKeyboardButton(f"🎬 {t.label}", callback_data=_cb(job.short_id, "v", str(t.idx)))]
-        for t in job.videos
+        for t in window
     ]
+    nav = _nav_row(job.short_id, "V", job.page_v, total)
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("✖ Cancel", callback_data=_cb(job.short_id, "x", "0"))])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_audios(job: Job) -> InlineKeyboardMarkup:
+    window, job.page_a, total = _paginate(job.audios, job.page_a)
     rows = [
         [InlineKeyboardButton(f"🎧 {t.label}", callback_data=_cb(job.short_id, "a", str(t.idx)))]
-        for t in job.audios
+        for t in window
     ]
+    nav = _nav_row(job.short_id, "A", job.page_a, total)
+    if nav:
+        rows.append(nav)
     if job.audios:
         rows.append([InlineKeyboardButton("⭐ All audio tracks", callback_data=_cb(job.short_id, "a", "all"))])
     rows.append([InlineKeyboardButton("✖ Cancel", callback_data=_cb(job.short_id, "x", "0"))])
@@ -352,10 +487,14 @@ def kb_audios(job: Job) -> InlineKeyboardMarkup:
 
 
 def kb_subs(job: Job) -> InlineKeyboardMarkup:
+    window, job.page_s, total = _paginate(job.subs, job.page_s)
     rows = [
         [InlineKeyboardButton(f"💬 {t.label}", callback_data=_cb(job.short_id, "s", str(t.idx)))]
-        for t in job.subs
+        for t in window
     ]
+    nav = _nav_row(job.short_id, "S", job.page_s, total)
+    if nav:
+        rows.append(nav)
     if job.subs:
         rows.append([InlineKeyboardButton("⭐ All subtitles", callback_data=_cb(job.short_id, "s", "all"))])
     rows.append([
@@ -693,6 +832,17 @@ async def run_job(app: Client, job: Job) -> None:
         await _run_nmdl_with_progress(job, status)
 
         media = _find_output_file(job)
+        # Apply user-chosen name if any.
+        if job.custom_name:
+            target = media.with_name(f"{job.custom_name}{media.suffix}")
+            try:
+                if target.exists():
+                    target.unlink()
+                media.rename(target)
+                media = target
+                log.info("renamed output to %s", media.name)
+            except OSError as e:
+                log.warning("rename to %s failed: %s — keeping original", target.name, e)
         await status.update(
             f"🖼️ <b>Generating thumbnail…</b>\nFile: <code>{media.name}</code>",
             force=True,
@@ -742,20 +892,49 @@ HELP_TEXT = (
     "<code>/dl N_m3u8DL-RE \"https://host/manifest.mpd\" "
     "-H \"User-Agent: Mozilla/5.0\" --key KID:KEY</code>\n\n"
     "Multiple <code>-H</code> and <code>--key</code> arguments are supported.\n"
-    "After parsing the manifest you'll pick Video → Audio → Subtitles, "
-    "and the bot will download, decrypt, mux to MKV, and upload back.\n\n"
+    "After the manifest is parsed you'll pick Video → Audio → Subtitles "
+    "(paginated when there are many tracks), then enter a custom file name "
+    "(or <code>/skip</code> for the default). The bot downloads, decrypts, "
+    "muxes to MKV, and uploads back.\n\n"
+    "<b>Commands</b>\n"
+    "  /dl       — start a download\n"
+    "  /skip     — keep the auto-generated file name\n"
+    "  /cancel   — abort your active job\n"
+    "  /help     — show this help\n\n"
     f"Concurrency limit: <b>{MAX_CONCURRENT}</b> simultaneous downloads."
+)
+
+OWNER_HELP_TEXT = (
+    "<b>Owner commands</b>\n"
+    "  /auth &lt;user_id&gt;   — grant access\n"
+    "  /unauth &lt;user_id&gt; — revoke access\n"
+    "  /authlist           — list authorized users\n"
+    "  /logs [N]           — last N log lines (default 50)\n"
+    "  /shell &lt;cmd&gt;       — run a shell command on the host\n"
+    "  /restart            — restart the bot process"
 )
 
 
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 async def cmd_help(client: Client, message: Message):
-    await message.reply_text(HELP_TEXT, disable_web_page_preview=True)
+    body = HELP_TEXT
+    if not _is_authorized(message.from_user.id):
+        body += (
+            "\n\n⛔ <b>You are not authorized.</b> "
+            f"Send your user id <code>{message.from_user.id}</code> to the owner "
+            "and ask them to <code>/auth</code> you."
+        )
+    if _is_owner(message.from_user.id):
+        body += "\n\n" + OWNER_HELP_TEXT
+    await message.reply_text(body, disable_web_page_preview=True)
 
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cmd_cancel(client: Client, message: Message):
     """Cancel any active job owned by this user."""
+    if not _is_authorized(message.from_user.id):
+        await message.reply_text("⛔ Not authorized.")
+        return
     cancelled = 0
     for job in list(JOBS.values()):
         if job.user_id != message.from_user.id:
@@ -772,6 +951,11 @@ async def cmd_cancel(client: Client, message: Message):
 
 @app.on_message(filters.command("dl") & filters.private)
 async def cmd_dl(client: Client, message: Message):
+    if not _is_authorized(message.from_user.id):
+        await message.reply_text(
+            f"⛔ Not authorized. Your id: <code>{message.from_user.id}</code>"
+        )
+        return
     raw = (message.text or "").split(None, 1)
     if len(raw) < 2:
         await message.reply_text(
@@ -837,7 +1021,7 @@ async def cmd_dl(client: Client, message: Message):
     )
 
 
-@app.on_callback_query(filters.regex(r"^j:[0-9a-f]{8}:[vasx]:"))
+@app.on_callback_query(filters.regex(r"^j:[0-9a-f]{8}:[vasxVASn]:"))
 async def on_choice(client: Client, cq: CallbackQuery):
     try:
         _, short_id, step, value = cq.data.split(":", 3)
@@ -853,6 +1037,32 @@ async def on_choice(client: Client, cq: CallbackQuery):
         return
     if cq.from_user.id != job.user_id:
         await cq.answer("Not your job.", show_alert=True)
+        return
+
+    # Inert page-indicator button.
+    if step == "n":
+        await cq.answer()
+        return
+
+    # Page navigation: V / A / S → re-render the same step's keyboard.
+    if step in ("V", "A", "S"):
+        try:
+            new_page = int(value)
+        except ValueError:
+            await cq.answer("Bad page", show_alert=True)
+            return
+        if step == "V":
+            job.page_v = new_page
+            kb = kb_videos(job)
+        elif step == "A":
+            job.page_a = new_page
+            kb = kb_audios(job)
+        else:
+            job.page_s = new_page
+            kb = kb_subs(job)
+        with contextlib.suppress(MessageNotModified):
+            await cq.message.edit_reply_markup(reply_markup=kb)
+        await cq.answer()
         return
 
     # Cancel
@@ -893,14 +1103,14 @@ async def on_choice(client: Client, cq: CallbackQuery):
                 reply_markup=kb_audios(job),
             )
         else:
-            # No audio tracks listed → skip directly to subs (or download).
+            # No audio tracks listed → skip directly to subs / filename prompt.
             if job.subs:
                 await cq.message.edit_text(
                     f"🎬 Video: <code>{tid}</code>\n\n💬 <b>Pick subtitles</b>",
                     reply_markup=kb_subs(job),
                 )
             else:
-                asyncio.create_task(run_job(client, job))
+                await _enter_name_step(cq.message, job)
         return
 
     if step == "a":
@@ -919,7 +1129,7 @@ async def on_choice(client: Client, cq: CallbackQuery):
                 reply_markup=kb_subs(job),
             )
         else:
-            asyncio.create_task(run_job(client, job))
+            await _enter_name_step(cq.message, job)
         return
 
     if step == "s":
@@ -932,15 +1142,210 @@ async def on_choice(client: Client, cq: CallbackQuery):
                 return
         job.chosen_sub = tid
         await cq.answer("Subtitles set")
-
-        await cq.message.edit_text(
-            f"🎬 Video: <code>{job.chosen_video}</code>\n"
-            f"🎧 Audio: <code>{job.chosen_audio}</code>\n"
-            f"💬 Subs:  <code>{job.chosen_sub}</code>\n\n"
-            f"⏳ <b>Adding to queue…</b>",
-        )
-        asyncio.create_task(run_job(client, job))
+        await _enter_name_step(cq.message, job)
         return
+
+
+async def _enter_name_step(message: Message, job: Job) -> None:
+    """Prompt the user for a custom filename. Their next text message — or
+    /skip — will resume the job."""
+    # Only one job per user can be awaiting a name at a time. Drop the flag
+    # from any previous awaiting jobs by the same user.
+    for j in JOBS.values():
+        if j.user_id == job.user_id and j is not job:
+            j.awaiting_name = False
+    job.awaiting_name = True
+    summary = (
+        f"🎬 Video: <code>{job.chosen_video}</code>\n"
+        f"🎧 Audio: <code>{job.chosen_audio or 'auto'}</code>\n"
+        f"💬 Subs:  <code>{job.chosen_sub or 'none'}</code>\n\n"
+        f"📝 <b>Send a file name</b> (no extension), "
+        f"or /skip to keep the default."
+    )
+    with contextlib.suppress(Exception):
+        await message.edit_text(summary)
+
+
+def _find_awaiting_job(user_id: int) -> Optional[Job]:
+    return next(
+        (j for j in JOBS.values() if j.user_id == user_id and j.awaiting_name),
+        None,
+    )
+
+
+@app.on_message(filters.command("skip") & filters.private)
+async def cmd_skip(client: Client, message: Message):
+    """Resume an awaiting-name job using the auto-generated filename."""
+    job = _find_awaiting_job(message.from_user.id)
+    if not job:
+        await message.reply_text("Nothing waiting for a name.")
+        return
+    job.awaiting_name = False
+    job.custom_name = None
+    await message.reply_text("⏭ Using default name. ⏳ Queueing…")
+    asyncio.create_task(run_job(client, job))
+
+
+@app.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
+async def on_text(client: Client, message: Message):
+    """Capture a filename if the user has a job waiting on it."""
+    job = _find_awaiting_job(message.from_user.id)
+    if not job:
+        return
+    job.custom_name = sanitize_filename(message.text or "")
+    job.awaiting_name = False
+    await message.reply_text(
+        f"📝 Filename: <code>{html.escape(job.custom_name)}</code>\n⏳ Queueing…"
+    )
+    asyncio.create_task(run_job(client, job))
+
+
+# ---------------------------------------------------------------------------
+# Owner-only commands
+# ---------------------------------------------------------------------------
+
+def _parse_uid_arg(message: Message) -> Optional[int]:
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+@app.on_message(filters.command("auth") & filters.private)
+async def cmd_auth(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    uid = _parse_uid_arg(message)
+    if uid is None:
+        await message.reply_text("Usage: <code>/auth &lt;user_id&gt;</code>")
+        return
+    AUTH_USERS.add(uid)
+    _save_auth()
+    await message.reply_text(f"✅ Authorized <code>{uid}</code>.")
+
+
+@app.on_message(filters.command("unauth") & filters.private)
+async def cmd_unauth(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    uid = _parse_uid_arg(message)
+    if uid is None:
+        await message.reply_text("Usage: <code>/unauth &lt;user_id&gt;</code>")
+        return
+    if uid in AUTH_USERS:
+        AUTH_USERS.discard(uid)
+        _save_auth()
+        await message.reply_text(f"🚫 Revoked <code>{uid}</code>.")
+    else:
+        await message.reply_text(f"<code>{uid}</code> wasn't authorized.")
+
+
+@app.on_message(filters.command("authlist") & filters.private)
+async def cmd_authlist(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    if not AUTH_USERS:
+        await message.reply_text("(no authorized users)")
+        return
+    body = "\n".join(f"• <code>{u}</code>" for u in sorted(AUTH_USERS))
+    await message.reply_text(f"<b>Authorized users</b>\n{body}")
+
+
+@app.on_message(filters.command("logs") & filters.private)
+async def cmd_logs(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    parts = (message.text or "").split()
+    n = 50
+    if len(parts) > 1 and parts[1].isdigit():
+        n = max(1, min(int(parts[1]), LOG_BUFFER))
+    lines = list(LOG_RING.buf)[-n:]
+    text = "\n".join(lines) if lines else "(no logs)"
+    if len(text) <= 3500:
+        await message.reply_text(f"<pre>{html.escape(text)}</pre>")
+        return
+    # Too long — send as a file.
+    tmp = DOWNLOAD_ROOT / f"logs_{int(time.time())}.txt"
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        await message.reply_document(str(tmp), caption=f"Last {n} log lines")
+    finally:
+        with contextlib.suppress(Exception):
+            tmp.unlink()
+
+
+@app.on_message(filters.command("shell") & filters.private)
+async def cmd_shell(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    parts = (message.text or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply_text("Usage: <code>/shell &lt;command&gt;</code>")
+        return
+    cmd = parts[1]
+    log.warning("owner shell: %s", cmd)
+    note = await message.reply_text(f"⚙️ Running…\n<code>{html.escape(cmd)}</code>")
+
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=SHELL_TIMEOUT)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        await note.edit_text(
+            f"⏱ Timed out after {SHELL_TIMEOUT:.0f}s\n<code>{html.escape(cmd)}</code>"
+        )
+        return
+
+    output = stdout.decode("utf-8", errors="ignore") if stdout else ""
+    rc = proc.returncode
+    summary_head = f"⚙️ <code>{html.escape(cmd)}</code>\nrc=<b>{rc}</b>\n"
+
+    full = f"{summary_head}\n<pre>{html.escape(output) or '(no output)'}</pre>"
+    if len(full) <= 3500:
+        await note.edit_text(full)
+        return
+
+    tmp = DOWNLOAD_ROOT / f"shell_{int(time.time())}.txt"
+    try:
+        tmp.write_text(output, encoding="utf-8")
+        await note.edit_text(summary_head + "(output attached)")
+        await message.reply_document(str(tmp), caption=f"rc={rc}")
+    finally:
+        with contextlib.suppress(Exception):
+            tmp.unlink()
+
+
+@app.on_message(filters.command("restart") & filters.private)
+async def cmd_restart(client: Client, message: Message):
+    if not _is_owner(message.from_user.id):
+        await message.reply_text("⛔ Owner only.")
+        return
+    await message.reply_text("♻️ Restarting…")
+    log.warning("owner-triggered restart")
+    # Best-effort: terminate any in-flight subprocesses so they don't leak.
+    for j in list(JOBS.values()):
+        j.cancelled = True
+        if j.proc and j.proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                j.proc.terminate()
+    # Give Telegram a moment to flush the outgoing reply, then exec ourselves.
+    await asyncio.sleep(1.0)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 # ---------------------------------------------------------------------------
