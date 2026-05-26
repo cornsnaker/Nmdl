@@ -886,26 +886,39 @@ app = Client(
 )
 
 
+START_TEXT = (
+    "👋 <b>Welcome to nmdl-bot</b>\n\n"
+    "I download Widevine/HLS/DASH streams via "
+    "<a href=\"https://github.com/nilaoda/N_m3u8DL-RE\">N_m3u8DL-RE</a>, "
+    "decrypt them, mux to MKV, and upload the result back to you.\n\n"
+    "Send /help for the full command reference."
+)
+
 HELP_TEXT = (
-    "<b>nmdl-bot</b>\n\n"
-    "Send a Widevine/HLS/DASH manifest with N_m3u8DL-RE-style flags:\n\n"
+    "<b>📖 nmdl-bot — usage</b>\n\n"
+    "<b>Quick start</b>\n"
     "<code>/dl N_m3u8DL-RE \"https://host/manifest.mpd\" "
     "-H \"User-Agent: Mozilla/5.0\" --key KID:KEY</code>\n\n"
-    "Multiple <code>-H</code> and <code>--key</code> arguments are supported.\n"
-    "After the manifest is parsed you'll pick Video → Audio → Subtitles "
-    "(paginated when there are many tracks), then enter a custom file name "
-    "(or <code>/skip</code> for the default). The bot downloads, decrypts, "
-    "muxes to MKV, and uploads back.\n\n"
-    "<b>Commands</b>\n"
-    "  /dl       — start a download\n"
-    "  /skip     — keep the auto-generated file name\n"
-    "  /cancel   — abort your active job\n"
-    "  /help     — show this help\n\n"
-    f"Concurrency limit: <b>{MAX_CONCURRENT}</b> simultaneous downloads."
+    "Any number of <code>-H</code> and <code>--key</code> arguments is allowed. "
+    "Both <code>--header=…</code> and <code>--key=…</code> styles work too.\n\n"
+    "<b>Flow</b>\n"
+    "1. The bot probes the manifest with <code>--more-info</code>.\n"
+    "2. Pick <i>video → audio → subtitles</i> from inline buttons "
+    "(paginated when there are many tracks).\n"
+    "3. Reply with a custom file name, or send /skip for the default.\n"
+    "4. The job is queued, downloaded, decrypted, muxed to MKV, "
+    "and uploaded back with a generated thumbnail.\n\n"
+    "<b>User commands</b>\n"
+    "  /start    — welcome screen\n"
+    "  /help     — this message\n"
+    "  /dl …     — start a new download\n"
+    "  /skip     — accept the auto-generated file name\n"
+    "  /cancel   — abort your active job(s)\n\n"
+    f"Concurrency: <b>{MAX_CONCURRENT}</b> simultaneous download(s)."
 )
 
 OWNER_HELP_TEXT = (
-    "<b>Owner commands</b>\n"
+    "<b>🛡 Owner commands</b>\n"
     "  /auth &lt;user_id&gt;   — grant access\n"
     "  /unauth &lt;user_id&gt; — revoke access\n"
     "  /authlist           — list authorized users\n"
@@ -915,15 +928,27 @@ OWNER_HELP_TEXT = (
 )
 
 
-@app.on_message(filters.command(["start", "help"]) & filters.private)
+def _auth_footer(uid: int) -> str:
+    if _is_authorized(uid):
+        return ""
+    return (
+        "\n\n⛔ <b>You are not authorized yet.</b>\n"
+        f"Send your user id <code>{uid}</code> to the owner and ask them to "
+        "<code>/auth</code> you."
+    )
+
+
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(client: Client, message: Message):
+    body = START_TEXT + _auth_footer(message.from_user.id)
+    if _is_owner(message.from_user.id):
+        body += "\n\n" + OWNER_HELP_TEXT
+    await message.reply_text(body, disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, message: Message):
-    body = HELP_TEXT
-    if not _is_authorized(message.from_user.id):
-        body += (
-            "\n\n⛔ <b>You are not authorized.</b> "
-            f"Send your user id <code>{message.from_user.id}</code> to the owner "
-            "and ask them to <code>/auth</code> you."
-        )
+    body = HELP_TEXT + _auth_footer(message.from_user.id)
     if _is_owner(message.from_user.id):
         body += "\n\n" + OWNER_HELP_TEXT
     await message.reply_text(body, disable_web_page_preview=True)
